@@ -4,6 +4,7 @@
  */
 
 import type {
+  Expand,
   Raw,
   SqlMode,
   SqlValue,
@@ -13,12 +14,16 @@ import type {
 import { Buffer } from 'buffer';
 
 export type {
+  Expand,
   Raw,
   SqlMode,
   SqlValue,
   TemporalValue,
   Timezone,
 } from './types.js';
+
+/** Owned by every value `expand()` marks, and shared through the global registry by the CommonJS build, the ESM build, and every installed copy. */
+export const EXPAND_SYMBOL: unique symbol = Symbol.for('sql-escaper.expand');
 
 const CONTEXT_TRIGGER = new Uint8Array(128);
 
@@ -357,6 +362,46 @@ const findSetKeyword = (
   return -1;
 };
 
+const createSetAssignmentTest = (sql: string, ansiQuotes: boolean) => {
+  let setIndex = -2; // -2 = not yet computed, -1 = no SET found
+  let nextSetIndex = -1; // -1 = no SET after setIndex
+
+  return (chunkIndex: number, placeholderPosition: number): boolean => {
+    // A SET assignment follows the keyword (a letter) or a comma continuing the list
+    let previous = placeholderPosition - 1;
+    while (previous >= chunkIndex && isWhitespace(sql.charCodeAt(previous)))
+      previous--;
+
+    const previousChar =
+      previous >= chunkIndex ? toLower(sql.charCodeAt(previous)) : 0;
+
+    if (
+      (previousChar < 97 || previousChar > 122) &&
+      previousChar !== charCode.comma
+    )
+      return false;
+
+    // Lazy: resolve the first SET and its successor once
+    if (setIndex === -2) {
+      setIndex = findSetKeyword(sql, 0, ansiQuotes);
+      nextSetIndex =
+        setIndex === -1 ? -1 : findSetKeyword(sql, setIndex, ansiQuotes);
+    }
+
+    // Nearest: advance to the SET closest before this placeholder
+    while (nextSetIndex !== -1 && nextSetIndex <= placeholderPosition) {
+      setIndex = nextSetIndex;
+      nextSetIndex = findSetKeyword(sql, nextSetIndex, ansiQuotes);
+    }
+
+    return (
+      setIndex !== -1 &&
+      setIndex <= placeholderPosition &&
+      isInSetAssignmentList(sql, setIndex, placeholderPosition, ansiQuotes)
+    );
+  };
+};
+
 const isDate = (value: unknown): value is Date =>
   Object.prototype.toString.call(value) === '[object Date]';
 
@@ -368,6 +413,33 @@ const hasSqlString = (value: unknown): value is Raw =>
   value !== null &&
   'toSqlString' in value &&
   typeof value.toSqlString === 'function';
+
+const isOwn = <Key extends PropertyKey>(
+  value: object,
+  key: Key
+): value is Record<Key, unknown> => hasOwnProperty.call(value, key);
+
+const isExpandable = (value: object): value is Expand['value'] =>
+  !(
+    Array.isArray(value) ||
+    value instanceof Uint8Array ||
+    value instanceof Date ||
+    hasSqlString(value) ||
+    isDate(value)
+  ) &&
+  (isRecord(value) || value instanceof Map);
+
+const isMarkable = (value: unknown): value is Expand['value'] =>
+  typeof value === 'object' &&
+  value !== null &&
+  isExpandable(value) &&
+  !hasOwnProperty.call(value, EXPAND_SYMBOL);
+
+const isMark = (value: object): value is Expand =>
+  isOwn(value, EXPAND_SYMBOL) &&
+  value[EXPAND_SYMBOL] === true &&
+  isOwn(value, 'value') &&
+  isMarkable(value.value);
 
 const escapeString = (value: string): string => {
   const escapeChars = regex.escapeChars;
@@ -539,20 +611,24 @@ export const escapeId = (
   }
 
   const identifier = String(value);
-  const hasJsonOperator = !forbidQualified && identifier.indexOf('->') !== -1;
 
-  if (forbidQualified || hasJsonOperator) {
-    if (identifier.indexOf('`') === -1) return `\`${identifier}\``;
+  if (identifier.indexOf('`') === -1) {
+    if (
+      forbidQualified ||
+      identifier.indexOf('.') === -1 ||
+      identifier.indexOf('->') !== -1
+    )
+      return `\`${identifier}\``;
 
-    return `\`${identifier.replace(regex.backtick, '``')}\``;
+    return `\`${identifier.replace(regex.dot, '`.`')}\``;
   }
 
-  if (identifier.indexOf('`') === -1 && identifier.indexOf('.') === -1)
-    return `\`${identifier}\``;
+  const quoted = identifier.replace(regex.backtick, '``');
 
-  return `\`${identifier
-    .replace(regex.backtick, '``')
-    .replace(regex.dot, '`.`')}\``;
+  if (forbidQualified || identifier.indexOf('->') !== -1)
+    return `\`${quoted}\``;
+
+  return `\`${quoted.replace(regex.dot, '`.`')}\``;
 };
 
 export const objectToValues = (
@@ -568,7 +644,7 @@ export const objectToValues = (
       if (sql.length > 0) sql += ', ';
       sql += escapeId(String(key));
       sql += ' = ';
-      sql += escape(value, true, timezone);
+      sql += escapeValue(value, true, timezone, false);
     }
 
     return sql;
@@ -584,7 +660,7 @@ export const objectToValues = (
     if (sql.length > 0) sql += ', ';
     sql += escapeId(key);
     sql += ' = ';
-    sql += escape(value, true, timezone);
+    sql += escapeValue(value, true, timezone, false);
   }
 
   return sql;
@@ -605,16 +681,17 @@ export const arrayToList = (array: SqlValue[], timezone?: Timezone): string => {
     if (Array.isArray(value)) sql += `(${arrayToList(value, timezone)})`;
     else if (value instanceof Set)
       sql += `(${arrayToList(Array.from(value), timezone)})`;
-    else sql += escape(value, true, timezone);
+    else sql += escapeValue(value, true, timezone, false);
   }
 
   return sql;
 };
 
-export const escape = (
+const escapeValue = (
   value: SqlValue,
-  stringifyObjects?: boolean,
-  timezone?: Timezone
+  stringifyObjects: boolean | undefined,
+  timezone: Timezone | undefined,
+  topLevel: boolean
 ): string => {
   if (value === undefined || value === null) return 'NULL';
 
@@ -637,6 +714,8 @@ export const escape = (
       if (value instanceof Uint8Array)
         return bufferToString(Buffer.from(value));
       if (hasSqlString(value)) return String(value.toSqlString());
+      if (topLevel && isMark(value))
+        return objectToValues(value.value, timezone);
       if (!(stringifyObjects === undefined || stringifyObjects === null))
         return escapeString(String(value));
       if (isRecord(value) || value instanceof Map)
@@ -653,6 +732,12 @@ export const escape = (
   }
 };
 
+export const escape = (
+  value: SqlValue,
+  stringifyObjects?: boolean,
+  timezone?: Timezone
+): string => escapeValue(value, stringifyObjects, timezone, true);
+
 // biome-ignore lint/complexity/useMaxParams: the first four parameters keep sqlstring's positional API
 export const format = (
   sql: string,
@@ -668,8 +753,7 @@ export const format = (
   const valuesArray: SqlValue[] = Array.isArray(values) ? values : [values];
   const length = valuesArray.length;
 
-  let setIndex = -2; // -2 = not yet computed, -1 = no SET found
-  let nextSetIndex = -1; // -1 = no SET after setIndex
+  let isSetAssignment: ReturnType<typeof createSetAssignmentTest> | undefined;
   let result = '';
   let chunkIndex = 0;
   let valuesIndex = 0;
@@ -705,59 +789,25 @@ export const format = (
       currentValue !== null &&
       !stringifyObjects
     ) {
-      const expandable =
-        !(
-          Array.isArray(currentValue) ||
-          currentValue instanceof Uint8Array ||
-          currentValue instanceof Date ||
-          hasSqlString(currentValue) ||
-          isDate(currentValue)
-        ) &&
-        (isRecord(currentValue) || currentValue instanceof Map);
+      if (!isExpandable(currentValue))
+        escapedValue = escapeValue(currentValue, true, timezone, false);
+      else if (isMark(currentValue))
+        escapedValue = objectToValues(currentValue.value, timezone);
+      else {
+        if (isSetAssignment === undefined)
+          isSetAssignment = createSetAssignmentTest(sql, ansiQuotes);
 
-      if (expandable) {
-        // A SET assignment follows the keyword (a letter) or a comma continuing the list
-        let previous = placeholderPosition - 1;
-        while (previous >= chunkIndex && isWhitespace(sql.charCodeAt(previous)))
-          previous--;
-
-        const previousChar =
-          previous >= chunkIndex ? toLower(sql.charCodeAt(previous)) : 0;
-
-        if (
-          (previousChar < 97 || previousChar > 122) &&
-          previousChar !== charCode.comma
-        )
-          escapedValue = escape(currentValue, true, timezone);
-        else {
-          // Lazy: resolve the first SET and its successor once
-          if (setIndex === -2) {
-            setIndex = findSetKeyword(sql, 0, ansiQuotes);
-            nextSetIndex =
-              setIndex === -1 ? -1 : findSetKeyword(sql, setIndex, ansiQuotes);
-          }
-
-          // Nearest: advance to the SET closest before this placeholder
-          while (nextSetIndex !== -1 && nextSetIndex <= placeholderPosition) {
-            setIndex = nextSetIndex;
-            nextSetIndex = findSetKeyword(sql, nextSetIndex, ansiQuotes);
-          }
-
-          if (
-            setIndex !== -1 &&
-            setIndex <= placeholderPosition &&
-            isInSetAssignmentList(
-              sql,
-              setIndex,
-              placeholderPosition,
-              ansiQuotes
-            )
-          )
-            escapedValue = objectToValues(currentValue, timezone);
-          else escapedValue = escape(currentValue, true, timezone);
-        }
-      } else escapedValue = escape(currentValue, true, timezone);
-    } else escapedValue = escape(currentValue, stringifyObjects, timezone);
+        if (isSetAssignment(chunkIndex, placeholderPosition))
+          escapedValue = objectToValues(currentValue, timezone);
+        else escapedValue = escapeValue(currentValue, true, timezone, false);
+      }
+    } else
+      escapedValue = escapeValue(
+        currentValue,
+        stringifyObjects,
+        timezone,
+        true
+      );
 
     result += sql.slice(chunkIndex, placeholderPosition);
     result += escapedValue;
@@ -779,4 +829,13 @@ export const raw = (sql: string): Raw => {
   return {
     toSqlString: () => sql,
   };
+};
+
+export const expand = (
+  value: Record<string, unknown> | Map<string, SqlValue>
+): Expand => {
+  if (!isMarkable(value))
+    throw new TypeError('argument value must be an object or a Map');
+
+  return { [EXPAND_SYMBOL]: true, value };
 };
