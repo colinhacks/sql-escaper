@@ -517,7 +517,7 @@ const readNoBackslashEscapes = (sqlMode: SqlMode): boolean => {
   if (noBackslashEscapes === undefined) return false;
   if (typeof noBackslashEscapes !== 'boolean')
     throw new TypeError(
-      `sqlMode.noBackslashEscapes must be a boolean, received ${typeof noBackslashEscapes}`
+      `sqlMode.noBackslashEscapes must be a boolean, received ${noBackslashEscapes === null ? 'null' : typeof noBackslashEscapes}`
     );
 
   return noBackslashEscapes;
